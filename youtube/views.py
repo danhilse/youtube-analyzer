@@ -16,6 +16,7 @@ from .serializers import (
     ChannelSerializer, VideoSerializer,
     VideoMetricsSerializer, TranscriptSerializer
 )
+from asgiref.sync import async_to_sync
 
 class PlaylistViewSet(viewsets.ViewSet):
     """
