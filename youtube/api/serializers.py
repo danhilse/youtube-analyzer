@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Channel, Video, VideoMetrics, Transcript
+from ..models import Channel, Video, VideoMetrics, Transcript
 
 class ChannelSerializer(serializers.ModelSerializer):
     class Meta:

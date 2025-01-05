@@ -2,16 +2,16 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.conf import settings
-from .models import Channel, Video
+from ..models import Channel, Video
 from .serializers import (
     ChannelSerializer, VideoSerializer,
     VideoMetricsSerializer, TranscriptSerializer
 )
 from rest_framework.decorators import api_view
-from .services.youtube import YouTubeService
+from ..services.youtube import YouTubeService
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from .models import Channel, Video, VideoMetrics, Transcript
+from ..models import Channel, Video, VideoMetrics, Transcript
 from .serializers import (
     ChannelSerializer, VideoSerializer,
     VideoMetricsSerializer, TranscriptSerializer
