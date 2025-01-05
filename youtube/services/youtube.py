@@ -5,6 +5,7 @@ from googleapiclient.discovery import build
 from django.conf import settings
 from youtube_transcript_api import YouTubeTranscriptApi
 from ..models import Channel, Video, Transcript, VideoMetrics
+from asgiref.sync import async_to_sync
 
 class YouTubeService:
     def __init__(self, api_key: str):
@@ -88,75 +89,212 @@ class YouTubeService:
             # Fetch transcript
             transcript_data = await self._fetch_transcript(video_id)
             
-            return {
-                'youtube_id': video_id,
+            video_data = {
+                'youtube_id': video_id,  # Keep youtube_id in the dictionary
                 'title': item['snippet']['title'],
                 'description': item['snippet']['description'],
                 'published_at': item['contentDetails']['videoPublishedAt'],
                 'view_count': int(details.get('statistics', {}).get('viewCount', 0)),
                 'like_count': int(details.get('statistics', {}).get('likeCount', 0)),
-                'duration': self._parse_duration(details.get('contentDetails', {}).get('duration', 'PT0S')),
-                'transcript': transcript_data
+                'duration': self._parse_duration(details.get('contentDetails', {}).get('duration', 'PT0S'))
             }
+            
+            # Save to database
+            try:
+                # Update or create video
+                video, created = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: Video.objects.update_or_create(
+                        youtube_id=video_id,
+                        defaults={
+                            'channel': channel,
+                            **{k: v for k, v in video_data.items() if k != 'youtube_id'}
+                        }
+                    )
+                )
+                
+                # Create metrics record
+                await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: VideoMetrics.objects.create(
+                        video=video,
+                        view_count=video_data['view_count'],
+                        like_count=video_data['like_count']
+                    )
+                )
+                
+                # Create transcript if available
+                if transcript_data:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: Transcript.objects.get_or_create(
+                            video=video,
+                            defaults=transcript_data
+                        )
+                    )
+                
+            except Exception as e:
+                print(f"Error processing video {video_id}: {str(e)}")
+                # Continue processing other videos even if one fails
+            
+            return video_data  # Return the complete video data including youtube_id
         
         # Process all videos in this batch concurrently
         results = await asyncio.gather(*[
             process_video(item) for item in videos_batch
         ])
         
-        # Save to database
-        for video_data in results:
-            transcript_data = video_data.pop('transcript', None)
-            youtube_id = video_data.pop('youtube_id')
-            
-            # Split into dynamic and static fields
-            dynamic_fields = {
-                'view_count': video_data.pop('view_count'),
-                'like_count': video_data.pop('like_count')
-            }
-            
-            defaults_dict = {
-                'channel': channel,
-                **dynamic_fields,
-            }
-            
-            # Run update_or_create, ignoring video_data in the defaults for now
-            video, created = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: Video.objects.update_or_create(
-                    youtube_id=youtube_id,
-                    defaults=defaults_dict
-                )
-            )
-
-            # If newly created, set those fields explicitly and save
-            if created:
-                for key, val in video_data.items():
-                    setattr(video, key, val)
-                video.save()
-            
-            # Create metrics record
-            await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: VideoMetrics.objects.create(
-                    video=video,
-                    **dynamic_fields
-                )
-            )
-            
-            # Create transcript if available and doesn't exist
-            if transcript_data:
-                await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: Transcript.objects.get_or_create(
-                        video=video,
-                        defaults=transcript_data
-                    )
-                )
-        
         new_count = processed_count + len(results)
         print(f"Processed {new_count} videos so far...")
         return results
+    def save_playlist_videos(self, playlist_id: str) -> List[Video]:
+        """Save or update all videos from a playlist including transcripts"""
+        from asgiref.sync import async_to_sync
+        
+        # First get playlist info
+        playlist_info = self.youtube.playlists().list(
+            part="snippet",
+            id=playlist_id
+        ).execute()
+        
+        if not playlist_info.get('items'):
+            raise ValueError(f"No playlist found for ID: {playlist_id}")
+        
+        # Create a temporary channel to associate these videos with
+        playlist_data = playlist_info['items'][0]['snippet']
+        channel_id = playlist_data['channelId']
+        
+        # Get or create the channel
+        channel_data = self.get_channel_data(channel_id)
+        channel, _ = Channel.objects.update_or_create(
+            youtube_id=channel_data['youtube_id'],
+            defaults={
+                'title': channel_data['title'],
+                'description': channel_data['description'],
+                'subscriber_count': channel_data['subscriber_count'],
+                'video_count': channel_data['video_count']
+            }
+        )
+        
+        # Run async video collection using async_to_sync and return the Video objects
+        video_dicts = async_to_sync(self._get_playlist_videos_async)(playlist_id, channel)
+        
+        # Convert the dictionaries to Video objects
+        videos = []
+        for video_data in video_dicts:
+            video, created = Video.objects.update_or_create(
+                youtube_id=video_data['youtube_id'],
+                defaults={
+                    'channel': channel,
+                    'title': video_data['title'],
+                    'description': video_data['description'],
+                    'published_at': video_data['published_at'],
+                    'view_count': video_data['view_count'],
+                    'like_count': video_data['like_count'],
+                    'duration': video_data['duration']
+                }
+            )
+            videos.append(video)
+        
+        return videos
+    
+    async def _get_playlist_videos_async(self, playlist_id: str, channel: Channel, max_results: int = None, timeout: int = 30) -> List[Dict]:
+        """Fetch all videos from a playlist asynchronously with timeout"""
+        import logging
+        logger = logging.getLogger(__name__)
+        print(f"Starting video collection for playlist {playlist_id}")
+        
+        videos = []
+        next_page_token = None
+        processed_count = 0
+        
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+            # First, get total count
+            initial_response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.youtube.playlistItems().list(
+                    part="snippet",
+                    playlistId=playlist_id,
+                    maxResults=1
+                ).execute()
+            )
+            total_videos = int(initial_response.get('pageInfo', {}).get('totalResults', 0))
+            logger.info(f"Total videos in playlist: {total_videos}")
+            
+            if total_videos > 500:  # Set a reasonable limit
+                raise ValueError(f"Playlist too large ({total_videos} videos). Maximum supported is 500.")
+            logger.info(f"Starting playlist processing: {playlist_id}")
+            while True:
+                # Get playlist items
+                response = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self.youtube.playlistItems().list(
+                        part="snippet,contentDetails",
+                        playlistId=playlist_id,
+                        maxResults=50,
+                        pageToken=next_page_token
+                    ).execute()
+                )
+                
+                if not response.get('items'):
+                    break
+                
+                print(f"Fetching details for batch of {len(response['items'])} videos...")
+                batch_results = await self._process_video_batch(
+                    session,
+                    response['items'],
+                    channel,
+                    processed_count
+                )
+                videos.extend(batch_results)
+                processed_count += len(batch_results)
+                
+                next_page_token = response.get('nextPageToken')
+                if not next_page_token or (max_results and len(videos) >= max_results):
+                    break
+        
+        print(f"Completed playlist video collection. Processed {len(videos)} videos total.")
+        return videos[:max_results] if max_results else videos
+    async def _get_playlist_videos_async(self, playlist_id: str, channel: Channel, max_results: int = None) -> List[Dict]:
+        """Fetch all videos from a playlist asynchronously"""
+        print(f"Starting video collection for playlist {playlist_id}")
+        
+        videos = []
+        next_page_token = None
+        processed_count = 0
+        
+        async with aiohttp.ClientSession() as session:
+            while True:
+                # Get playlist items
+                response = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self.youtube.playlistItems().list(
+                        part="snippet,contentDetails",
+                        playlistId=playlist_id,
+                        maxResults=50,
+                        pageToken=next_page_token
+                    ).execute()
+                )
+                
+                if not response.get('items'):
+                    break
+                
+                print(f"Fetching details for batch of {len(response['items'])} videos...")
+                batch_results = await self._process_video_batch(
+                    session,
+                    response['items'],
+                    channel,
+                    processed_count
+                )
+                videos.extend(batch_results)
+                processed_count += len(batch_results)
+                
+                next_page_token = response.get('nextPageToken')
+                if not next_page_token or (max_results and len(videos) >= max_results):
+                    break
+        
+        print(f"Completed playlist video collection. Processed {len(videos)} videos total.")
+        return videos[:max_results] if max_results else videos
 
     async def _get_channel_videos_async(self, channel_id: str, channel: Channel, max_results: int = None) -> List[Dict]:
         """Fetch all videos for a channel asynchronously"""
