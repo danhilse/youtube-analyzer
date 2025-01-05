@@ -1,4 +1,5 @@
 from django.db import models
+from .managers import VideoQuerySet, ChannelQuerySet, TranscriptQuerySet
 
 class Channel(models.Model):
     youtube_id = models.CharField(max_length=255, unique=True)
@@ -8,6 +9,8 @@ class Channel(models.Model):
     video_count = models.IntegerField(null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    objects = ChannelQuerySet.as_manager()
 
     def __str__(self):
         return f"{self.title} ({self.youtube_id})"
@@ -24,8 +27,19 @@ class Video(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    objects = VideoQuerySet.as_manager()
+
     def __str__(self):
         return f"{self.title} ({self.youtube_id})"
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['published_at']),
+            models.Index(fields=['view_count']),
+            models.Index(fields=['like_count']),
+            models.Index(fields=['duration']),
+            models.Index(fields=['channel', 'published_at']),
+        ]
 
 class VideoMetrics(models.Model):
     video = models.ForeignKey(Video, on_delete=models.CASCADE, related_name='metrics')
@@ -36,6 +50,9 @@ class VideoMetrics(models.Model):
     class Meta:
         verbose_name_plural = "Video metrics"
         ordering = ['-captured_at']
+        indexes = [
+            models.Index(fields=['captured_at']),
+        ]
 
     def __str__(self):
         return f"Metrics for {self.video.title} at {self.captured_at}"
@@ -46,6 +63,14 @@ class Transcript(models.Model):
     language = models.CharField(max_length=10)
     is_generated = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = TranscriptQuerySet.as_manager()
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['language']),
+            models.Index(fields=['is_generated']),
+        ]
 
     def __str__(self):
         return f"Transcript for {self.video.title} ({self.language})"
